@@ -11,7 +11,7 @@ main() {
     build.dep(b, "avnserver/.build-seed.ae")
 
     aether.driver_test(b) {
-        driver(".test_acl_driver.ae")
+        driver("test_acl_driver.ae")
         output("test_acl_driver")
 
         binary_under_test(b, "avn") {

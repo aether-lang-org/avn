@@ -11,7 +11,7 @@ main() {
     build.dep(b, "avnserver/.build-seed.ae")
 
     aether.driver_test(b) {
-        driver(".test_verify_driver.ae")
+        driver("test_verify_driver.ae")
         output("test_verify_driver")
 
         // Stage 1: fixture sha1 server. Stage 2 (sha256) spawned

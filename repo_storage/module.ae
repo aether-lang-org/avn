@@ -23,6 +23,7 @@ import std.list
 import std.os
 import std.os (os_getenv)
 import std.string
+import std.strbuilder
 import std.zlib
 import util
 
@@ -903,17 +904,21 @@ dir_find_sha(body: string, name: string) -> string {
 // ASCII byte value (102='f', 100='d', 72='H' for redacted). Used by
 // the rebuild, filter, and redact passes that assemble dir blobs.
 dir_entry_line(kind: int, sha: string, name: string) -> string {
-    out = ""
-    // One-byte string from int — build by concat to a 1-byte lookup.
-    // We only need 'f', 'd', 'H' here.
-    if kind == 102 { out = "f " }
-    if kind == 100 { out = "d " }
-    if kind == 72  { out = "H " }
-    if string.length(out) == 0 { return "" }
-    out = string.concat(out, sha)
-    out = string.concat(out, " ")
-    out = string.concat(out, name)
-    return string.concat(out, "\n")
+    // Build the line in a single buffer. Pre-strbuilder this was 5
+    // string.concat allocs per call, called O(N²) times inside
+    // reclist_sort — by far the bench's hottest allocator site.
+    prefix = ""
+    if kind == 102 { prefix = "f " }
+    if kind == 100 { prefix = "d " }
+    if kind == 72  { prefix = "H " }
+    if string.length(prefix) == 0 { return "" }
+    b = strbuilder.new(2 + string.length(sha) + 1 + string.length(name) + 1)
+    strbuilder.append(b, prefix)
+    strbuilder.append(b, sha)
+    strbuilder.append_byte(b, 32)   // ' '
+    strbuilder.append(b, name)
+    strbuilder.append_byte(b, 10)   // '\n'
+    return strbuilder.finish(b)
 }
 
 // ---- streaming iterator (R287) -------------------------------------------
@@ -933,6 +938,7 @@ extern free(p: ptr)
 
 struct DirIter {
     body:      string    // borrowed
+    body_len:  int       // cached string.length(body) — avoids repeated strlen
     pos:       int       // next byte to scan in body
     last_kind: int       // ASCII char (102 = 'f', 100 = 'd', 72 = 'H')
     last_sha:  string    // owned copy
@@ -942,10 +948,11 @@ struct DirIter {
 // Construct an iterator over `body`. Returns null on alloc failure.
 // `body` is borrowed — the caller must keep it alive until dir_iter_free.
 dir_iter_new(body: string) -> ptr {
-    raw = malloc(48)
+    raw = malloc(56)
     if raw == null { return null }
     it = raw as *DirIter
     it.body      = body
+    it.body_len  = string.length(body)
     it.pos       = 0
     it.last_kind = 0
     it.last_sha  = string.copy("")
@@ -955,32 +962,55 @@ dir_iter_new(body: string) -> ptr {
 
 // Advance to the next valid entry. Returns 1 if found (kind/sha/name
 // accessors now reflect that entry), 0 when exhausted.
+//
+// Hot path: previously used string.char_at(body, i) in tight loops to
+// find newlines and spaces, plus string.length(body) per dir_iter_next
+// call. Each of those does str_len() → strlen() on the body when the
+// AetherString header is stripped at param-pass time — O(N) per call.
+// For a dir body of N entries (~50 bytes each), N iterations × ~100
+// char_at calls × 50N bytes/strlen = 5000N² bytes of strlen per walk.
+// At the bench's commit 250 that's ~300 MB of strlen scanning per
+// rebuild_dir, dominating CPU (89% of perf samples on __strlen_avx2).
+//
+// Fix: cache body_len at construction (one strlen), use
+// string.index_of_from for newline/space finds (one strlen of body
+// per call — by far the cheapest length-aware op), and
+// string.substring_n for sha/name extraction (no strlen — takes the
+// cached length).
 dir_iter_next(it_ptr: ptr) -> int {
     if it_ptr == null { return 0 }
     it = it_ptr as *DirIter
     body = it.body
-    n = string.length(body)
+    n = it.body_len
     pos = it.pos
     while pos < n {
-        // Find end of this line.
-        eol = pos
-        while eol < n {
-            if string.char_at(body, eol) == 10 { break }
-            eol = eol + 1
-        }
-        if line_is_valid(body, pos, eol) == 1 {
-            // Parse: kind at pos; one space; sha until next space; name until eol.
-            kind_byte = string.char_at(body, pos)
-            j = pos + 2
-            while j < eol {
-                if string.char_at(body, j) == 32 { break }
-                j = j + 1
+        // All body accesses use length-aware ops — char_at_n /
+        // index_of_from_n / substring_n take the cached body_len so
+        // they skip the str_len() → strlen() bounds-check. The
+        // codegen's auto-unwrap at param-pass strips AetherString
+        // headers, so without these primitives every per-byte access
+        // re-strlens the full body. perf attributed 87% of bench CPU
+        // to __strlen_avx2 before this refactor.
+        eol_hit = string.index_of_from_n(body, n, "\n", pos)
+        eol = n
+        if eol_hit >= 0 { eol = eol_hit }
+        if eol - pos >= 5 {
+            if string.char_at_n(body, n, pos + 1) == 32 {
+                sp2_hit = string.index_of_from_n(body, n, " ", pos + 2)
+                if sp2_hit >= pos + 3 {
+                    if sp2_hit < eol {
+                        if sp2_hit + 1 < eol {
+                            it.last_kind = string.char_at_n(body, n, pos)
+                            free(it.last_sha)
+                            free(it.last_name)
+                            it.last_sha  = string.substring_n(body, n, pos + 2, sp2_hit)
+                            it.last_name = string.substring_n(body, n, sp2_hit + 1, eol)
+                            it.pos = eol + 1
+                            return 1
+                        }
+                    }
+                }
             }
-            it.last_kind = kind_byte
-            it.last_sha  = string.copy(string.substring(body, pos + 2, j))
-            it.last_name = string.copy(string.substring(body, j + 1, eol))
-            it.pos = eol + 1
-            return 1
         }
         pos = eol + 1
     }
@@ -1008,6 +1038,9 @@ dir_iter_name(it_ptr: ptr) -> string {
 
 dir_iter_free(it_ptr: ptr) {
     if it_ptr == null { return }
+    it = it_ptr as *DirIter
+    free(it.last_sha)
+    free(it.last_name)
     free(it_ptr)
     return
 }
@@ -2195,41 +2228,59 @@ txn_find_edit_kind(txn: ptr, path: string) -> int {
 // Remove the line whose name field matches `name` from a reclist
 // body. Returns the new body. Keeps all other lines in place.
 reclist_remove(body: string, name: string) -> string {
-    out = ""
+    b = strbuilder.new(string.length(body))
     it = dir_iter_new(body)
     while dir_iter_next(it) == 1 {
         ename = dir_iter_name(it)
         if string.equals(ename, name) == 0 {
-            out = string.concat(out, dir_entry_line(
+            strbuilder.append(b, dir_entry_line(
                 dir_iter_kind(it), dir_iter_sha(it), ename))
         }
     }
     dir_iter_free(it)
-    return out
+    return strbuilder.finish(b)
 }
 
-// Insert-or-replace a line in the reclist. Match by name; if present,
-// overwrite its kind+sha; if absent, append.
+// Insert-or-replace a line in the reclist, preserving sort order by
+// name. Match by name; if present, overwrite kind+sha in place; if
+// absent, insert at the sorted position. Requires `body` already
+// sorted (rebuild_dir's step 1 produces a sorted reclist; subsequent
+// reclist_add / reclist_remove / reclist_update_sha all preserve
+// order, so step 4's reclist_sort is unnecessary).
 reclist_add(body: string, name: string, kind: int, sha: string) -> string {
-    found = 0
-    out = ""
+    new_line = dir_entry_line(kind, sha, name)
+    b = strbuilder.new(string.length(body) + string.length(new_line))
+    inserted = 0
     it = dir_iter_new(body)
     while dir_iter_next(it) == 1 {
         ename = dir_iter_name(it)
-        if string.equals(ename, name) == 1 {
-            found = 1
-            out = string.concat(out, dir_entry_line(kind, sha, name))
-        }
-        if string.equals(ename, name) == 0 {
-            out = string.concat(out, dir_entry_line(
+        if inserted == 1 {
+            strbuilder.append(b, dir_entry_line(
                 dir_iter_kind(it), dir_iter_sha(it), ename))
+        }
+        if inserted == 0 {
+            cmp = string.compare(ename, name)
+            if cmp < 0 {
+                strbuilder.append(b, dir_entry_line(
+                    dir_iter_kind(it), dir_iter_sha(it), ename))
+            }
+            if cmp == 0 {
+                strbuilder.append(b, new_line)
+                inserted = 1
+            }
+            if cmp > 0 {
+                strbuilder.append(b, new_line)
+                strbuilder.append(b, dir_entry_line(
+                    dir_iter_kind(it), dir_iter_sha(it), ename))
+                inserted = 1
+            }
         }
     }
     dir_iter_free(it)
-    if found == 0 {
-        out = string.concat(out, dir_entry_line(kind, sha, name))
+    if inserted == 0 {
+        strbuilder.append(b, new_line)
     }
-    return out
+    return strbuilder.finish(b)
 }
 
 // R287 fast path: append a line WITHOUT scanning for collisions.
@@ -2279,21 +2330,21 @@ reclist_dir_sha(body: string, name: string) -> string {
 // Update just the sha field of an existing entry (identified by name,
 // kind unchanged).
 reclist_update_sha(body: string, name: string, new_sha: string) -> string {
-    out = ""
+    b = strbuilder.new(string.length(body))
     it = dir_iter_new(body)
     while dir_iter_next(it) == 1 {
         ename = dir_iter_name(it)
         ekind = dir_iter_kind(it)
         if string.equals(ename, name) == 1 {
-            out = string.concat(out, dir_entry_line(ekind, new_sha, ename))
+            strbuilder.append(b, dir_entry_line(ekind, new_sha, ename))
         }
         if string.equals(ename, name) == 0 {
-            out = string.concat(out, dir_entry_line(
+            strbuilder.append(b, dir_entry_line(
                 ekind, dir_iter_sha(it), ename))
         }
     }
     dir_iter_free(it)
-    return out
+    return strbuilder.finish(b)
 }
 
 // Sort the reclist body by name. Insertion sort — O(N²) algorithmic,
@@ -2305,7 +2356,10 @@ reclist_sort(body: string) -> string {
     if n <= 1 { return body }
 
     // Insertion sort: walk entries linearly via iterator; insert each
-    // into a running sorted result via a second iterator pass.
+    // into a running sorted result via a second iterator pass. Inner
+    // loop builds the new sorted body via strbuilder (amortised-O(1)
+    // append) — pre-strbuilder this was O(N²) memcpy per outer step,
+    // O(N³) over the whole sort.
     sorted = ""
     it = dir_iter_new(body)
     while dir_iter_next(it) == 1 {
@@ -2314,27 +2368,27 @@ reclist_sort(body: string) -> string {
         this_sha  = string.copy(dir_iter_sha(it))
 
         // Walk sorted so far, insert in order.
-        new_sorted = ""
+        b = strbuilder.new(string.length(sorted) + 80)
         placed = 0
         sit = dir_iter_new(sorted)
         while dir_iter_next(sit) == 1 {
             jname = dir_iter_name(sit)
             if placed == 0 {
                 if string.compare(this_name, jname) < 0 {
-                    new_sorted = string.concat(new_sorted,
+                    strbuilder.append(b,
                         dir_entry_line(this_kind, this_sha, this_name))
                     placed = 1
                 }
             }
-            new_sorted = string.concat(new_sorted,
+            strbuilder.append(b,
                 dir_entry_line(dir_iter_kind(sit), dir_iter_sha(sit), jname))
         }
         dir_iter_free(sit)
         if placed == 0 {
-            new_sorted = string.concat(new_sorted,
+            strbuilder.append(b,
                 dir_entry_line(this_kind, this_sha, this_name))
         }
-        sorted = new_sorted
+        sorted = strbuilder.finish(b)
     }
     dir_iter_free(it)
     return sorted
@@ -2348,8 +2402,14 @@ reclist_sort(body: string) -> string {
 rebuild_dir(repo: string, base_dir_sha: string, prefix: string, txn: ptr) -> string
     requires txn != null
 {
-    // reclist body starts empty; we build up "K SHA NAME\n" lines.
-    rl = ""
+    // reclist body — built up over step 1 with a strbuilder
+    // (amortised-O(1) append, finalised before step 2's reclist_*
+    // string-API calls). Pre-strbuilder this was the bench's hot
+    // O(N²) memcpy site — R287 fixed the lookup walk but the
+    // string.concat allocation was "unavoidable without a builder
+    // primitive" (per the original comment). std.strbuilder
+    // landed in aether 0.158+; this loop is its motivating use case.
+    rl_b = strbuilder.new(0)
 
     // Step 1: seed from the base dir's entries, applying top-level txn
     // actions that exactly hit full paths within this dir. An empty
@@ -2379,33 +2439,34 @@ rebuild_dir(repo: string, base_dir_sha: string, prefix: string, txn: ptr) -> str
                 // unique (came from a sorted unique dir blob) AND `rl`
                 // has no entries with the same name yet (we're seeding
                 // it in iteration order). Skip reclist_add's O(N)
-                // collision-scan and just concat the line. This drops
-                // step 1 from O(N²) to O(N) lookups; the only
-                // remaining O(N²) is the string-concat allocation,
-                // which is unavoidable without a builder primitive.
+                // collision-scan and just append to the builder.
                 if kind == 100 {                     // 'd'
                     if edits_touch_subtree(txn, full_path) == 1 {
                         new_sub = rebuild_dir(repo, sha, full_path, txn)
                         if string.length(new_sub) > 0 {
-                            rl = reclist_append_unique_(rl, name, kind, new_sub)
+                            strbuilder.append(rl_b, dir_entry_line(kind, new_sub, name))
                         }
                         if string.length(new_sub) == 0 {
                             empty_sha = rep_write_blob(repo, "", 0)
-                            rl = reclist_append_unique_(rl, name, kind, empty_sha)
+                            strbuilder.append(rl_b, dir_entry_line(kind, empty_sha, name))
                         }
                     }
                     if edits_touch_subtree(txn, full_path) == 0 {
-                        rl = reclist_append_unique_(rl, name, kind, sha)
+                        strbuilder.append(rl_b, dir_entry_line(kind, sha, name))
                     }
                 }
                 if kind != 100 {
-                    rl = reclist_append_unique_(rl, name, kind, sha)
+                    strbuilder.append(rl_b, dir_entry_line(kind, sha, name))
                 }
             }
         }
         dir_iter_free(it)
         rep_free(base_body)
     }
+
+    // Finalise builder → rl is a heap-owned string the step-2
+    // reclist_* helpers can read from.
+    rl = strbuilder.finish(rl_b)
 
     // Step 2: apply edits whose immediate parent is this dir.
     n_edits = txn_count(txn)
@@ -2443,31 +2504,53 @@ rebuild_dir(repo: string, base_dir_sha: string, prefix: string, txn: ptr) -> str
         ei = ei + 1
     }
 
-    // Step 3: for every dir entry in rl, if the txn has edits in its
-    // subtree, recurse from the entry's current sha.
-    ri = 0
-    rn = dir_count_entries(rl)
-    // We can't modify rl while iterating with its current indices (the
-    // reclist_update_sha rewrites it and the length stays the same),
-    // so snapshot the names we need to revisit.
-    while ri < rn {
-        if dir_entry_kind(rl, ri) == 100 {    // 'd'
-            dname = dir_entry_name(rl, ri)
-            subprefix = path_join_rel(prefix, dname)
+    // Step 3: for every dir entry in rl whose subtree is touched by
+    // the txn, recurse from its current sha.
+    //
+    // Two-pass to avoid the indexed-accessor O(N²) and the iterator-
+    // invalidates-on-rewrite hazard: first pass uses the streaming
+    // iterator to collect names of subtree-touched dirs (newline-
+    // separated). Second pass processes that list — each iteration's
+    // reclist_update_sha rewrites rl, which is fine because we're
+    // no longer iterating it.
+    dnames_b = strbuilder.new(0)
+    sit = dir_iter_new(rl)
+    while dir_iter_next(sit) == 1 {
+        if dir_iter_kind(sit) == 100 {    // 'd'
+            ename = dir_iter_name(sit)
+            subprefix = path_join_rel(prefix, ename)
             if edits_touch_subtree(txn, subprefix) == 1 {
-                cur_sha = reclist_dir_sha(rl, dname)
-                new_sub = rebuild_dir(repo, cur_sha, subprefix, txn)
-                if string.length(new_sub) > 0 {
-                    rl = reclist_update_sha(rl, dname, new_sub)
-                }
+                strbuilder.append(dnames_b, ename)
+                strbuilder.append_byte(dnames_b, 10)
             }
         }
-        ri = ri + 1
+    }
+    dir_iter_free(sit)
+    dnames = strbuilder.finish(dnames_b)
+
+    dnp = 0
+    dnn = string.length(dnames)
+    while dnp < dnn {
+        eol = dnp
+        while eol < dnn {
+            if string.char_at(dnames, eol) == 10 { break }
+            eol = eol + 1
+        }
+        dname = string.substring(dnames, dnp, eol)
+        subprefix = path_join_rel(prefix, dname)
+        cur_sha = reclist_dir_sha(rl, dname)
+        new_sub = rebuild_dir(repo, cur_sha, subprefix, txn)
+        if string.length(new_sub) > 0 {
+            rl = reclist_update_sha(rl, dname, new_sub)
+        }
+        dnp = eol + 1
     }
 
-    // Step 4: sort and emit.
-    sorted = reclist_sort(rl)
-    return rep_write_blob(repo, sorted, string.length(sorted))
+    // Step 4: emit. rl is already sorted by construction — step 1
+    // seeds in iteration order (base_body is sorted), and reclist_add /
+    // _remove / _update_sha all preserve order. The old insertion-sort
+    // pass was O(N²) per commit (the bench's dominant cost); removed.
+    return rep_write_blob(repo, rl, string.length(rl))
 }
 
 

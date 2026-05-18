@@ -10,7 +10,7 @@ main() {
     build.dep(b, "avnserver/.build-seed.ae")
 
     aether.driver_test(b) {
-        driver(".test_client_driver.ae")
+        driver("test_client_driver.ae")
         output("test_client_driver")
 
         // Note the env_var override: by default binary_under_test(b,

@@ -10,3 +10,9 @@ target/
 # SDK at .aeb/lib/svnae/ which lives in this repo.
 /.aeb/lib/*
 !/.aeb/lib/svnae/
+
+# local tooling / stray artifacts
+.claude/
+__pycache__/
+/-o
+/hb_wc/

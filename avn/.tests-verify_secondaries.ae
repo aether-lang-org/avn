@@ -9,7 +9,7 @@ main() {
     build.dep(b, "avnserver")
 
     aether.driver_test(b) {
-        driver(".test_verify_secondaries_driver.ae")
+        driver("test_verify_secondaries_driver.ae")
         output("test_verify_secondaries_driver")
 
         // No fixture_seed/server — the driver owns the lifecycle since

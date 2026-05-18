@@ -26,7 +26,7 @@ main() {
     build.dep(b, "avnserver")
 
     aether.driver_test(b) {
-        driver(".test_cherry_convergence_driver.ae")
+        driver("test_cherry_convergence_driver.ae")
         output("test_cherry_convergence_driver")
 
         binary_under_test(b, "avn") {

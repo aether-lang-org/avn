@@ -10,7 +10,7 @@ main() {
     build.dep(b, "avn")
 
     aether.driver_test(b) {
-        driver(".test_rest_put_driver.ae")
+        driver("test_rest_put_driver.ae")
         output("test_rest_put_driver")
 
         binary_under_test(b, "avn") {

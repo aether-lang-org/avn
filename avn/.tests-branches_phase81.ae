@@ -9,7 +9,7 @@ main() {
     build.dep(b, "avnserver")
 
     aether.driver_test(b) {
-        driver(".test_branches_phase81_driver.ae")
+        driver("test_branches_phase81_driver.ae")
         output("test_branches_phase81_driver")
 
         // No fixture_seed/server — driver creates repo via avnadmin

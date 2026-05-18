@@ -10,7 +10,7 @@ main() {
     build.dep(b, "avnserver/.build-seed.ae")
 
     aether.driver_test(b) {
-        driver(".test_commit_driver.ae")
+        driver("test_commit_driver.ae")
         output("test_commit_driver")
 
         binary_under_test(b, "avn") {
